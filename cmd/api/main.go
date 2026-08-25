@@ -22,7 +22,7 @@ func createJobHandler(client *redis.Client) http.HandlerFunc{
 			ID:			fmt.Sprintf("%d",time.Now().UnixNano()),
 			Type: 	"sleep",
 			Status: "queued",
-			Duration: 10,
+			Duration: 60,
 		}
 
 		ctx := context.Background()

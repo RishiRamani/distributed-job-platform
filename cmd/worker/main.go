@@ -70,14 +70,37 @@ func claimJob(
 }
 
 func executeJob(newJob job.Job) {
+	fmt.Println(newJob)
 	if newJob.Type == "sleep" {
 		time.Sleep(time.Duration(newJob.Duration) * time.Second)
 	}
-
-	fmt.Println(newJob)
 }
 
-func completeJob(ctx context.Context,client *redis.Client,jobID string){
+func renewLease(ctx context.Context,client *redis.Client,jobID string,done chan struct{}){
+	ticker := time.NewTicker(15 * time.Second)
+  defer ticker.Stop()
+	for{
+		select{
+			case <-done:
+				return
+			case <-ticker.C:
+				renewTime := time.Now().Add(5*time.Second).UnixMilli()
+				_, err := client.ZAdd(
+					ctx,
+					"job_leases",
+					redis.Z{
+						Score:  float64(renewTime),
+						Member: jobID,
+					},
+				).Result()
+				if err != nil {
+					panic(err)
+				}
+		}
+	}
+}
+
+func completeJob(ctx context.Context,client *redis.Client,jobID string,done chan struct{}){
 	_,err:=client.HDel(ctx, "active_jobs", jobID).Result()
 	if(err!=nil){
 		panic(err)
@@ -86,6 +109,7 @@ func completeJob(ctx context.Context,client *redis.Client,jobID string){
 	if(err!=nil){
 		panic(err)
 	}
+	close(done)
 }
 
 func main() {
@@ -110,8 +134,9 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-
+		done := make(chan struct{})
+		go renewLease(ctx,client,newJob.ID,done)
 		executeJob(newJob)
-		completeJob(ctx,client,newJob.ID)
+		completeJob(ctx,client,newJob.ID,done)
 	}
 }
