@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
-
 	"distributed-job-platform/internal/job"
 	"github.com/redis/go-redis/v9"
 )
+
+const maxRetries = 3
 
 func getJob(ctx context.Context, client *redis.Client) (job.Job, error) {
 	res, err := client.BRPop(ctx, 0, "jobs").Result()
@@ -69,11 +70,13 @@ func claimJob(
 	return nil
 }
 
-func executeJob(newJob job.Job) {
+func executeJob(newJob job.Job) error{
 	fmt.Println(newJob)
 	if newJob.Type == "sleep" {
 		time.Sleep(time.Duration(newJob.Duration) * time.Second)
+		return nil
 	}
+	return fmt.Errorf("unknown job type : %s",newJob.Type)
 }
 
 func renewLease(ctx context.Context,client *redis.Client,jobID string,done chan struct{}){
@@ -84,7 +87,7 @@ func renewLease(ctx context.Context,client *redis.Client,jobID string,done chan 
 			case <-done:
 				return
 			case <-ticker.C:
-				renewTime := time.Now().Add(5*time.Second).UnixMilli()
+				renewTime := time.Now().Add(30*time.Second).UnixMilli()
 				_, err := client.ZAdd(
 					ctx,
 					"job_leases",
@@ -112,6 +115,17 @@ func completeJob(ctx context.Context,client *redis.Client,jobID string,done chan
 	close(done)
 }
 
+func requeue(ctx context.Context,client *redis.Client,newJob job.Job){
+	res,err:=json.Marshal(newJob)
+	if(err!=nil){
+		panic(err)
+	}
+	_,err=client.LPush(ctx,"jobs",string(res)).Result()
+	if(err!=nil){
+		panic(err)
+	}
+}
+
 func main() {
 	workerID := fmt.Sprintf("Worker-%d", time.Now().UnixNano())
 
@@ -136,7 +150,16 @@ func main() {
 		}
 		done := make(chan struct{})
 		go renewLease(ctx,client,newJob.ID,done)
-		executeJob(newJob)
+		err=executeJob(newJob)
 		completeJob(ctx,client,newJob.ID,done)
+		if(err!=nil){
+			if newJob.Retries >= maxRetries {
+					newJob.Status="failed"
+			} else {
+					newJob.Retries++
+					requeue(ctx,client,newJob)
+			}
+		}
+		
 	}
 }

@@ -5,6 +5,7 @@ type Job struct{
 	Type	 string `json:"type"`
 	Status string `json:"status"`
 	Duration int `json:"duration"`
+	Retries int `json:"retries"`
 }
 
 type JobClaim struct{

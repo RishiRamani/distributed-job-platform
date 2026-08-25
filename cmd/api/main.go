@@ -20,9 +20,10 @@ func createJobHandler(client *redis.Client) http.HandlerFunc{
 	return func(w http.ResponseWriter, r *http.Request){
 		newJob := job.Job{
 			ID:			fmt.Sprintf("%d",time.Now().UnixNano()),
-			Type: 	"sleep",
+			Type: 	"slee",
 			Status: "queued",
 			Duration: 60,
+			Retries: 0,
 		}
 
 		ctx := context.Background()
