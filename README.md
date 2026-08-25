@@ -1,27 +1,18 @@
 # Distributed Job Platform
 
-A distributed background job processing system built from scratch using
-Go, Redis, and Docker.
+A distributed background job processing system built from scratch using Go, Redis, and Docker.
 
-The goal of this project is to understand how distributed job queues
-work internally, including worker coordination, job ownership, leases,
-failure recovery, and eventually reliable execution semantics.
+The goal of this project is to understand how distributed job queues work internally, including worker coordination, job ownership, leases, failure recovery, retries, and reliable execution semantics.
 
-> **Status:** Day 1 --- Core queue, workers, leases, and failure
-> recovery implemented. Lease renewal and further reliability mechanisms
-> are next.
+> **Status:** Core queue, workers, leases, lease renewal, failure recovery, retries, and failed-job persistence are implemented. Job lifecycle tracking and stronger reliability guarantees are next.
 
 ## Overview
 
-The platform allows an API to create jobs which are placed into a
-Redis-backed queue. Multiple worker processes can independently consume
-and execute jobs.
+The platform allows an API to create jobs which are placed into a Redis-backed queue. Multiple worker processes can independently consume and execute jobs.
 
-Workers claim jobs using a lease mechanism. If a worker crashes while
-processing a job, a separate Reaper process detects the expired lease
-and puts the job back into the queue so another worker can process it.
+Workers claim jobs using a lease mechanism. A heartbeat periodically renews the lease while a worker is healthy. If a worker crashes, a separate Reaper process detects the expired lease and puts the job back into the queue so another worker can process it.
 
-``` text
+```text
                     ┌──────────────┐
                     │     API      │
                     │   Go HTTP    │
@@ -35,6 +26,7 @@ and puts the job back into the queue so another worker can process it.
                     │ jobs         │
                     │ active_jobs  │
                     │ job_leases   │
+                    │ failed_jobs  │
                     └──────┬───────┘
                            │
                     BRPOP  │
@@ -59,19 +51,21 @@ and puts the job back into the queue so another worker can process it.
 
 The API creates jobs with:
 
--   Unique job ID
--   Job type
--   Job status
--   Duration
+- Unique job ID
+- Job type
+- Job status
+- Duration
+- Retry count
 
 Example:
 
-``` json
+```json
 {
   "id": "1787669074517250300",
   "type": "sleep",
   "status": "queued",
-  "duration": 10
+  "duration": 60,
+  "retries": 0
 }
 ```
 
@@ -79,81 +73,95 @@ Example:
 
 Jobs are serialized as JSON and stored in a Redis list.
 
-``` text
+```text
 jobs
 ┌──────────────────────────────┐
 │ Job C │ Job B │ Job A │ ... │
 └──────────────────────────────┘
 ```
 
-Workers use Redis `BRPOP` to wait for jobs instead of repeatedly polling
-an empty queue.
+Workers use Redis `BRPOP` to wait for jobs instead of repeatedly polling an empty queue.
 
 ### Multiple Workers
 
-Multiple independent worker processes can consume from the same Redis
-queue.
+Multiple independent worker processes can consume from the same Redis queue.
 
-``` text
-              Redis
-                │
-        ┌───────┼───────┐
-        ▼       ▼       ▼
-      Worker  Worker  Worker
-        1       2       3
-```
-
-Redis atomically removes jobs from the queue when they are popped,
-allowing different workers to receive different jobs.
+Redis atomically removes jobs from the queue when they are popped, allowing different workers to receive different jobs.
 
 ### Job Execution
 
 Jobs currently support a basic `sleep` job.
 
-For example, a duration of `10` causes the worker to sleep for 10
-seconds.
+For example, a duration of `60` causes the worker to sleep for 60 seconds.
 
-Job execution is separated from queue management so additional job types
-can be added later.
+Job execution is separated from queue management so additional job types can be added later.
+
+### Job Retries
+
+Failed jobs are retried up to the configured retry limit.
+
+The current configuration allows three retries after the initial attempt.
+
+```text
+attempt 1 → failure → retry 1
+attempt 2 → failure → retry 2
+attempt 3 → failure → retry 3
+attempt 4 → failure → permanently failed
+```
+
+Permanently failed jobs are stored in the `failed_jobs` Redis Hash using the job ID as the field.
 
 ## Job Claims and Leases
 
 When a worker receives a job, it records a claim containing:
 
-``` text
+```text
 Job
 Worker ID
 ```
 
-The claim is stored in the Redis hash:
+The claim is stored in the Redis hash `active_jobs`.
 
-``` text
-active_jobs
-```
-
-The worker also creates a lease for the job in the Redis sorted set:
-
-``` text
-job_leases
-```
+The worker also creates a lease for the job in the Redis sorted set `job_leases`.
 
 The current lease duration is 30 seconds.
 
-The sorted set uses:
-
-``` text
+```text
 member = Job ID
 score  = lease expiration timestamp
 ```
 
 This allows the Reaper to efficiently find expired jobs.
 
+### Lease Renewal
+
+Workers renew their lease every 15 seconds while executing a job.
+
+Each renewal pushes the expiration 30 seconds into the future.
+
+```text
+Initial claim
+     ↓
+30 second lease
+     ↓
+15 seconds
+     ↓
+renew → +30 seconds
+     ↓
+15 seconds
+     ↓
+renew → +30 seconds
+     ↓
+...
+```
+
+If the worker dies, the heartbeat stops and the lease eventually expires.
+
 ## Successful Job Completion
 
-When a worker successfully finishes a job, it cleans up its claim and
-lease:
+When a worker successfully finishes a job, its current claim and lease are removed:
 
-``` text
+```text
 claim
   ↓
 execute
@@ -165,14 +173,13 @@ HDEL active_jobs
 ZREM job_leases
 ```
 
-This prevents completed jobs from being treated as abandoned work later.
+Completed-job persistence and atomic state transitions are planned next so that successful jobs remain queryable without introducing inconsistent intermediate states.
 
 ## Failure Recovery
 
-A separate process called the **Reaper** periodically checks for expired
-leases.
+A separate process called the **Reaper** periodically checks for expired leases.
 
-``` text
+```text
 Worker claims Job A
         ↓
 Worker crashes
@@ -194,13 +201,15 @@ Another worker processes Job A
 
 This recovery mechanism has been tested by:
 
-1.  Starting a worker.
-2.  Submitting a long-running job.
-3.  Killing the worker while the job was executing.
-4.  Waiting for the lease to expire.
-5.  Allowing the Reaper to detect the expired job.
-6.  Starting another worker.
-7.  Verifying that the recovered job was processed again.
+1. Starting a worker.
+2. Submitting a long-running job.
+3. Killing the worker while the job was executing.
+4. Waiting for the lease to expire.
+5. Allowing the Reaper to detect the expired job.
+6. Starting another worker.
+7. Verifying that the recovered job was processed again.
+
+Lease renewal has also been tested with long-running jobs to verify that healthy workers do not get incorrectly reaped.
 
 ## Redis Data Model
 
@@ -208,68 +217,46 @@ This recovery mechanism has been tested by:
 
 A Redis List containing jobs waiting to be processed.
 
-``` text
-jobs
-┌──────┬──────┬──────┐
-│ JobA │ JobB │ JobC │
-└──────┴──────┴──────┘
-```
-
 Jobs are stored as JSON strings.
 
 ### `active_jobs`
 
 A Redis Hash containing currently claimed jobs.
 
-``` text
-active_jobs
-
+```text
 JobID → JobClaim JSON
-```
-
-Example:
-
-``` json
-{
-  "Job": {
-    "id": "1787669074517250300",
-    "type": "sleep",
-    "status": "queued",
-    "duration": 10
-  },
-  "WorkerId": "Worker-1787669064545528900"
-}
 ```
 
 ### `job_leases`
 
 A Redis Sorted Set used as an expiration index.
 
-``` text
-job_leases
-
-Job A → 1787669104531
-Job B → 1787669152000
-Job C → 1787669201000
+```text
+JobID → lease expiration timestamp
 ```
 
-The score is the lease expiration time in Unix milliseconds.
+The score is the lease expiration time in Unix milliseconds. The Reaper queries for members whose score is less than or equal to the current time.
 
-The Reaper queries for members whose score is less than or equal to the
-current time.
+### `failed_jobs`
+
+A Redis Hash containing jobs that have exhausted their retry attempts.
+
+```text
+JobID → Failed Job JSON
+```
+
+Using a hash allows a failed job to be looked up directly by its ID.
 
 ## Project Structure
 
-``` text
+```text
 distributed-job-platform/
 │
 ├── cmd/
 │   ├── api/
 │   │   └── main.go
-│   │
 │   ├── worker/
 │   │   └── main.go
-│   │
 │   └── reaper/
 │       └── main.go
 │
@@ -281,46 +268,47 @@ distributed-job-platform/
 └── README.md
 ```
 
-The shared `job` package contains the domain structures used by the API,
-workers, and Reaper.
+The shared `job` package contains the domain structures used by the API, workers, and Reaper.
 
 ## Technologies
 
--   **Go** --- API, workers, and Reaper
--   **Redis** --- job queue and distributed state
--   **Docker** --- local Redis environment
+- **Go** — API, workers, and Reaper
+- **Redis** — job queue and distributed state
+- **Docker** — local Redis environment
 
 ## What I Learned
 
 ### Redis
 
--   Redis Lists
--   Redis Hashes
--   Redis Sorted Sets
--   `BRPOP`
--   `HSET` / `HGET` / `HDEL`
--   `ZADD` / `ZRANGEBYSCORE` / `ZREM`
--   Blocking vs polling queue consumption
+- Redis Lists
+- Redis Hashes
+- Redis Sorted Sets
+- `BRPOP`
+- `HSET` / `HGET` / `HDEL`
+- `ZADD` / `ZRANGEBYSCORE` / `ZREM`
+- Blocking vs polling queue consumption
+- Using sorted-set scores as lease expiration timestamps
 
 ### Go
 
--   HTTP handlers
--   JSON serialization and deserialization
--   Shared packages
--   `context.Context`
--   Redis client usage
--   Multiple processes
--   Basic concurrency concepts
--   Struct composition
--   Error handling
+- HTTP handlers
+- JSON serialization and deserialization
+- Shared packages
+- `context.Context`
+- Redis client usage
+- Multiple processes
+- Goroutines
+- Channels
+- Tickers
+- `select`
+- Struct composition
+- Error handling
 
 ### Distributed Systems
 
-The biggest focus so far has been understanding failure modes.
+A basic queue has a serious failure mode:
 
-A basic queue has a serious problem:
-
-``` text
+```text
 Worker receives Job A
         ↓
 Job removed from queue
@@ -332,7 +320,7 @@ Job is lost
 
 Adding leases allows the system to detect abandoned work:
 
-``` text
+```text
 Worker receives Job A
         ↓
 Job gets a lease
@@ -344,150 +332,117 @@ Lease expires
 Reaper requeues Job A
 ```
 
-However, this does **not** guarantee exactly-once execution.
+Lease renewal prevents healthy workers processing long-running jobs from being incorrectly requeued.
+
+The retry mechanism also introduces an important distributed-systems property: execution is moving toward **at-least-once semantics**, meaning a job may execute more than once in some failure scenarios.
 
 ## Known Limitations
 
-### Lease Expiration During Valid Execution
+### At-Least-Once Execution
 
-The current lease lasts 30 seconds.
+The system does not guarantee exactly-once execution.
 
-If a job takes longer than 30 seconds:
+A worker can successfully perform a job's external side effect and then fail before the system records completion.
 
-``` text
-Worker 1
-   ↓
-Job A
-   ↓
-30 seconds
-   ↓
-lease expires
-   ↓
-Reaper requeues Job A
-   ↓
-Worker 2 receives Job A
+```text
+Worker executes job
+        ↓
+External side effect succeeds
+        ↓
+Worker crashes
+        ↓
+System cannot confirm completion
+        ↓
+Job may be retried
+        ↓
+Side effect may happen again
 ```
 
-Worker 1 may still be processing the original job.
+This is one of the next reliability problems to address.
 
-This can result in the same job being executed simultaneously by two
-workers.
+### Non-Atomic State Transitions
 
-### Next: Lease Renewal
+Job completion currently involves multiple Redis operations:
 
-Workers will periodically renew their leases while executing jobs.
-
-Planned mechanism:
-
-``` text
-Claim
-  ↓
-30 second lease
-  ↓
-renew after ~15 seconds
-  ↓
-renew again
-  ↓
-...
+```text
+HDEL active_jobs
+ZREM job_leases
 ```
 
-If the worker actually dies, renewals stop and the lease eventually
-expires.
+If a worker crashes between operations, Redis can temporarily contain inconsistent state.
 
-## Execution Semantics
-
-The system is currently moving toward **at-least-once execution**.
-
-The goal is:
-
-> Jobs should not be permanently lost, but a job may execute more than
-> once.
-
-Exactly-once execution is significantly harder because failures can
-occur between operations.
-
-For example:
-
-``` text
-Worker finishes job
-        ↓
-sends ACK
-        ↓
-network failure
-        ↓
-Worker does not know whether ACK reached Redis
-```
-
-A retry/recovery mechanism may therefore cause the same job to execute
-again.
-
-Future work will address duplicate execution through mechanisms such as
-idempotency.
+The next iteration will make job state transitions more robust and determine how completed jobs should be persisted and queried.
 
 ## Roadmap
 
 ### Reliability
 
--   [ ] Lease renewal / worker heartbeats
--   [ ] Handle lease ownership races
--   [ ] Retry failed jobs
--   [ ] Idempotency
--   [ ] Better failure handling
--   [ ] Graceful worker shutdown
+- [x] Lease renewal / worker heartbeats
+- [x] Worker crash recovery
+- [x] Retry failed jobs
+- [x] Retry limits
+- [x] Failed-job persistence
+- [ ] Handle lease ownership races
+- [ ] Idempotency
+- [ ] Atomic job state transitions
+- [ ] Better failure handling
+- [ ] Graceful worker shutdown
 
 ### Job Management
 
--   [ ] Job status endpoint
--   [ ] Job lookup by ID
--   [ ] Job cancellation
--   [ ] Job priorities
--   [ ] Scheduled jobs
--   [ ] Retry limits
+- [ ] Completed-job persistence
+- [ ] Job status endpoint
+- [ ] Job lookup by ID
+- [ ] Job cancellation
+- [ ] Job priorities
+- [ ] Scheduled jobs
+- [ ] Retry backoff
 
-### Infrastructure
+### Observability & Infrastructure
 
--   [ ] PostgreSQL persistence
--   [ ] Better Redis error handling
--   [ ] Metrics
--   [ ] Structured logging
--   [ ] Health checks
--   [ ] Load testing
--   [ ] Failure/chaos testing
+- [ ] Metrics
+- [ ] Structured logging
+- [ ] Health checks
+- [ ] Load testing
+- [ ] Failure/chaos testing
+- [ ] Better Redis error handling
 
 ### Deployment
 
--   [ ] Docker Compose
--   [ ] Containerize API
--   [ ] Containerize workers
--   [ ] Containerize Reaper
--   [ ] Production deployment
+- [ ] Docker Compose
+- [ ] Containerize API
+- [ ] Containerize workers
+- [ ] Containerize Reaper
+- [ ] Production deployment
 
-## Day 1 Milestone
+## Current Milestone
 
-At the end of Day 1, the system can:
+The system can currently:
 
-``` text
+```text
 Create a job
      ↓
 Persist it in Redis
      ↓
 Distribute it across multiple workers
      ↓
-Execute it
-     ↓
-Track worker ownership
+Claim ownership
      ↓
 Assign a lease
      ↓
-Clean up completed jobs
+Renew the lease while executing
+     ↓
+Execute the job
+     ↓
+Clean up completed attempts
      ↓
 Detect crashed workers
      ↓
 Requeue abandoned jobs
      ↓
-Allow another worker to execute them
+Retry failed jobs
+     ↓
+Persist permanently failed jobs
 ```
 
-The next major milestone is **lease renewal**, which will prevent
-healthy workers processing long-running jobs from having their work
-incorrectly requeued.
+The next major milestone is **robust job lifecycle management**, including completed-job persistence, status lookup, and safer state transitions.

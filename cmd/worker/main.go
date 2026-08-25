@@ -103,7 +103,7 @@ func renewLease(ctx context.Context,client *redis.Client,jobID string,done chan 
 	}
 }
 
-func completeJob(ctx context.Context,client *redis.Client,jobID string,done chan struct{}){
+func cleanupJob(ctx context.Context,client *redis.Client,jobID string,done chan struct{}){
 	_,err:=client.HDel(ctx, "active_jobs", jobID).Result()
 	if(err!=nil){
 		panic(err)
@@ -151,10 +151,18 @@ func main() {
 		done := make(chan struct{})
 		go renewLease(ctx,client,newJob.ID,done)
 		err=executeJob(newJob)
-		completeJob(ctx,client,newJob.ID,done)
+		cleanupJob(ctx,client,newJob.ID,done)
 		if(err!=nil){
 			if newJob.Retries >= maxRetries {
 					newJob.Status="failed"
+					jsonData,err := json.Marshal(newJob)
+					if(err!=nil){
+						panic(err)
+					}
+					_,err=client.HSet(ctx,"failed_jobs",newJob.ID,string(jsonData)).Result()
+					if(err!=nil){
+						panic(err)
+					}
 			} else {
 					newJob.Retries++
 					requeue(ctx,client,newJob)
