@@ -6,3 +6,8 @@ type Job struct{
 	Status string `json:"status"`
 	Duration int `json:"duration"`
 }
+
+type JobClaim struct{
+	Job Job
+	WorkerId string
+}

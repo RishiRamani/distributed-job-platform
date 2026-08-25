@@ -1,49 +1,117 @@
 package main
 
-import(
+import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/redis/go-redis/v9"
-	"context"
 	"time"
+
 	"distributed-job-platform/internal/job"
+	"github.com/redis/go-redis/v9"
 )
 
-func executeJob(newJob job.Job){
-	if(newJob.Type=="sleep"){
-		time.Sleep(time.Duration(newJob.Duration)*time.Second)
+func getJob(ctx context.Context, client *redis.Client) (job.Job, error) {
+	res, err := client.BRPop(ctx, 0, "jobs").Result()
+	if err != nil {
+		return job.Job{}, err
 	}
+
+	var newJob job.Job
+
+	err = json.Unmarshal([]byte(res[1]), &newJob)
+	if err != nil {
+		return job.Job{}, err
+	}
+
+	return newJob, nil
+}
+
+func claimJob(
+	ctx context.Context,
+	client *redis.Client,
+	newJob job.Job,
+	workerID string,
+) error {
+	newJobClaim := job.JobClaim{
+		Job:      newJob,
+		WorkerId: workerID,
+	}
+
+	jsonData, err := json.Marshal(newJobClaim)
+	if err != nil {
+		return err
+	}
+
+	_, err = client.HSet(
+		ctx,
+		"active_jobs",
+		newJob.ID,
+		string(jsonData),
+	).Result()
+	if err != nil {
+		return err
+	}
+
+	expiry := time.Now().Add(30 * time.Second).UnixMilli()
+
+	_, err = client.ZAdd(
+		ctx,
+		"job_leases",
+		redis.Z{
+			Score:  float64(expiry),
+			Member: newJob.ID,
+		},
+	).Result()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func executeJob(newJob job.Job) {
+	if newJob.Type == "sleep" {
+		time.Sleep(time.Duration(newJob.Duration) * time.Second)
+	}
+
 	fmt.Println(newJob)
 }
 
-func main(){
+func completeJob(ctx context.Context,client *redis.Client,jobID string){
+	_,err:=client.HDel(ctx, "active_jobs", jobID).Result()
+	if(err!=nil){
+		panic(err)
+	}
+	_,err=client.ZRem(ctx, "job_leases", jobID).Result()
+	if(err!=nil){
+		panic(err)
+	}
+}
+
+func main() {
+	workerID := fmt.Sprintf("Worker-%d", time.Now().UnixNano())
+
 	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr:     "localhost:6379",
 		Password: "",
-		DB: 0,
+		DB:       0,
 		Protocol: 2,
 	})
 
 	ctx := context.Background()
 
-	timeout := 0*time.Second
-
-	for{
-		res1,err := client.BRPop(ctx,timeout,"jobs").Result()
-
-		if(err==redis.Nil){
-			continue
-		}else if(err!=nil){
+	for {
+		newJob, err := getJob(ctx, client)
+		if err != nil {
 			panic(err)
-		}else{
-			var newJob job.Job
-			err := json.Unmarshal([]byte(res1[1]),&newJob)
-
-			if(err!=nil){
-				panic(err)
-			}
-			executeJob(newJob)
 		}
+
+		err = claimJob(ctx, client, newJob, workerID)
+		if err != nil {
+			panic(err)
+		}
+
+		executeJob(newJob)
+		completeJob(ctx,client,newJob.ID)
 	}
-	
 }
