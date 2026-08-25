@@ -7,13 +7,10 @@ import (
 	"net/http"
 	"time"
 	"github.com/redis/go-redis/v9"
+	"distributed-job-platform/internal/job"
 )
 
-type Job struct{
-	ID		 string `json:"id"`
-	Type	 string `json:"type"`
-	Status string `json:"status"`
-}
+
 
 func healthHandler(w http.ResponseWriter, r *http.Request){
 	fmt.Fprintln(w,"OK")
@@ -21,15 +18,16 @@ func healthHandler(w http.ResponseWriter, r *http.Request){
 
 func createJobHandler(client *redis.Client) http.HandlerFunc{
 	return func(w http.ResponseWriter, r *http.Request){
-		job := Job{
+		newJob := job.Job{
 			ID:			fmt.Sprintf("%d",time.Now().UnixNano()),
 			Type: 	"sleep",
 			Status: "queued",
+			Duration: 5,
 		}
 
 		ctx := context.Background()
 
-		jsonData, err:= json.Marshal(job)
+		jsonData, err:= json.Marshal(newJob)
 		if(err!=nil){
 			panic(err)
 		}
@@ -39,7 +37,7 @@ func createJobHandler(client *redis.Client) http.HandlerFunc{
 			panic(err)
 		}else{
 			w.Header().Set("Content-Type","application/json")
-			json.NewEncoder(w).Encode(job)
+			json.NewEncoder(w).Encode(newJob)
 		}
 
 		fmt.Println(res1)
