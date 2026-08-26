@@ -7,6 +7,8 @@ import (
 	"time"
 	"distributed-job-platform/internal/job"
 	"github.com/redis/go-redis/v9"
+	"os"
+	"os/signal"
 )
 
 const maxRetries = 3
@@ -185,7 +187,16 @@ func requeue(
 	}
 }
 
+func exitWorker(shutdown chan os.Signal, cancel context.CancelFunc){
+	<-shutdown
+	fmt.Println("Shutdown requested")
+	cancel()
+}
+
 func main() {
+	shutdown := make(chan os.Signal,1)
+	signal.Notify(shutdown,os.Interrupt)
+
 	workerID := fmt.Sprintf(
 		"Worker-%d",
 		time.Now().UnixNano(),
@@ -198,11 +209,20 @@ func main() {
 		Protocol: 2,
 	})
 
+	shutdownCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()	
+
 	ctx := context.Background()
 
+	go exitWorker(shutdown,cancel)
+	
 	for {
-		newJob, err := getJob(ctx, client)
+		newJob, err := getJob(shutdownCtx, client)
 		if err != nil {
+			if shutdownCtx.Err() != nil {
+					fmt.Println("Worker shutting down")
+					break
+			}
 			panic(err)
 		}
 
