@@ -17,11 +17,25 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 func createJobHandler(client *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var request job.CreateJobRequest
+
+		err:= json.NewDecoder(r.Body).Decode(&request)
+		if(err!=nil){
+			http.Error(w,"invalid request",http.StatusBadRequest)
+			return
+		}
+
 		newJob := job.Job{
 			ID:       fmt.Sprintf("%d", time.Now().UnixNano()),
-			Type:     "sleep",
+			Type:     request.Type,
 			Status:   "queued",
-			Duration: 60,
+			Duration: request.Duration,
 			Retries:  0,
 		}
 
@@ -58,6 +72,11 @@ func createJobHandler(client *redis.Client) http.HandlerFunc {
 
 func getJobHandler(client *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
 		jobID := strings.TrimPrefix(r.URL.Path, "/jobs/")
 
 		ctx := context.Background()

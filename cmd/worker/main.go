@@ -54,9 +54,14 @@ func main() {
 		newJob, err := getJob(shutdownCtx, client)
 		if err != nil {
 			if shutdownCtx.Err() != nil {
-					fmt.Println("Worker shutting down")
-					break
+				fmt.Println("Worker shutting down")
+				break
 			}
+
+			if err == redis.Nil {
+				continue
+			}
+
 			panic(err)
 		}
 
@@ -77,51 +82,33 @@ func main() {
 
 		err = executeJob(newJob)
 
-		isOwner, ownershipErr := ownershipOfJob(
-				ctx,
-				client,
-				newJob.ID,
-				workerID,
-		)
-
-		if ownershipErr != nil {
-				panic(ownershipErr)
-		}
-
-		if !isOwner {
-				fmt.Println("Lost ownership of job:", newJob.ID)
-				close(done)
-				continue
-		}
-
 		if err != nil {
 			if newJob.Retries >= maxRetries {
-				newJob.Status = "failed"
-
-				err = updateJob(ctx, client, newJob)
+				success,err := failJob(ctx,client,newJob,workerID)
 				if err != nil {
 					panic(err)
 				}
+				if !success {
+					fmt.Println("Lost ownership of job:", newJob.ID)
+				}
 			} else {
-				newJob.Retries++
-				requeue(ctx, client, newJob)
+				success,err:=requeue(ctx, client, newJob,workerID)
+				if(err!=nil){
+					panic(err)
+				}
+				if !success {
+					fmt.Println("Lost ownership of job:", newJob.ID)
+				}
 			}
 		} else {
-			
-			newJob.Status = "completed"
-
-			err = updateJob(ctx, client, newJob)
+			success,err := completeJob(ctx,client,newJob,workerID)
 			if err != nil {
 				panic(err)
 			}
+			if !success {
+				fmt.Println("Lost ownership of job:", newJob.ID)
+			}
 		}
-
-		cleanupJob(
-			ctx,
-			client,
-			newJob.ID,
-			workerID,
-			done,
-		)
+		close(done)
 	}
 }

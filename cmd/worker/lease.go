@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"time"
 	"github.com/redis/go-redis/v9"
 )
@@ -19,73 +20,40 @@ func renewLease(
 	for {
 		select {
 		case <-done:
-			return
+			return 
 
 		case <-ticker.C:
-
-			isOwner,err:=ownershipOfJob(ctx,client,jobID,workerID)
-
-			if(err!=nil){
-				return
-			}
-
-			if(!isOwner){
-				return
-			}
-
 			renewTime := time.Now().Add(30 * time.Second).UnixMilli()
+			script := redis.NewScript(`
+					local owner = redis.call("HGET",KEYS[1],ARGV[1])
+					if owner==ARGV[2] then
+						redis.call("ZADD",KEYS[2],ARGV[3],ARGV[1])
+						return 1
+					else
+						return 0
+					end
+			`)
 
-			_, err = client.ZAdd(
+			result, err := script.Run(
 				ctx,
-				"job_leases",
-				redis.Z{
-					Score:  float64(renewTime),
-					Member: jobID,
+				client,
+				[]string{
+					"active_jobs",
+					"job_leases",
 				},
+				jobID,
+				workerID,
+				renewTime,
 			).Result()
 
 			if err != nil {
 				panic(err)
 			}
+
+			if result == 0{
+				fmt.Println("Not the owner anymore")
+				return
+			}
 		}
 	}
-}
-
-func cleanupJob(
-	ctx context.Context,
-	client *redis.Client,
-	jobID string,
-	workerID string,
-	done chan struct{},
-) {
-
-	isOwner,err:=ownershipOfJob(ctx,client,jobID,workerID)
-
-	if(err!=nil){
-		return
-	}
-
-	if(!isOwner){
-		return
-	}
-
-	_, err = client.HDel(
-		ctx,
-		"active_jobs",
-		jobID,
-	).Result()
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = client.ZRem(
-		ctx,
-		"job_leases",
-		jobID,
-	).Result()
-	if err != nil {
-		panic(err)
-	}
-
-	close(done)
 }

@@ -8,7 +8,7 @@ type Job struct{
 	Retries int `json:"retries"`
 }
 
-type JobClaim struct{
-	Job Job
-	WorkerId string
+type CreateJobRequest struct{
+	Type string `json:"type"`
+	Duration int `json:"duration"`
 }

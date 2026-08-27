@@ -2,11 +2,12 @@ package main
 
 import (
 	"context"
+	"distributed-job-platform/internal/job"
 	"encoding/json"
 	"fmt"
 	"time"
+
 	"github.com/redis/go-redis/v9"
-	"distributed-job-platform/internal/job"
 )
 
 func findExpiredJobs(
@@ -33,37 +34,20 @@ func recoverJob(
 	ctx context.Context,
 	client *redis.Client,
 	jobID string,
-) {
-	// Make sure the job is still active.
-	workerID, err := client.HGet(
-		ctx,
-		"active_jobs",
-		jobID,
-	).Result()
+) (bool, error) {
 
-	if err == redis.Nil {
-		return
-	}
-
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Printf(
-		"Recovering job %s from %s\n",
-		jobID,
-		workerID,
-	)
-
-	// Get the canonical job data.
 	jobData, err := client.HGet(
 		ctx,
 		"job_data",
 		jobID,
 	).Result()
 
+	if err == redis.Nil {
+		return false, nil
+	}
+
 	if err != nil {
-		panic(err)
+		return false, err
 	}
 
 	var newJob job.Job
@@ -73,59 +57,62 @@ func recoverJob(
 		&newJob,
 	)
 	if err != nil {
-		panic(err)
+		return false, err
 	}
 
 	newJob.Status = "queued"
 
 	updatedData, err := json.Marshal(newJob)
 	if err != nil {
-		panic(err)
+		return false, err
 	}
 
-	// Update canonical job state.
-	_, err = client.HSet(
+	now := time.Now().UnixMilli()
+
+	script := redis.NewScript(`
+		local expiry = redis.call("ZSCORE", KEYS[4], ARGV[1])
+
+		if not expiry then
+			return 0
+		end
+
+		if tonumber(expiry) > tonumber(ARGV[3]) then
+			return 0
+		end
+
+		local owner = redis.call("HGET", KEYS[1], ARGV[1])
+
+		if not owner then
+			return 0
+		end
+
+		redis.call("HSET", KEYS[2], ARGV[1], ARGV[2])
+		redis.call("LPUSH", KEYS[3], ARGV[1])
+		redis.call("HDEL", KEYS[1], ARGV[1])
+		redis.call("ZREM", KEYS[4], ARGV[1])
+
+		return 1
+	`)
+
+	res, err := script.Run(
 		ctx,
-		"job_data",
+		client,
+		[]string{
+			"active_jobs",
+			"job_data",
+			"jobs",
+			"job_leases",
+		},
 		jobID,
 		string(updatedData),
-	).Result()
+		now,
+	).Int64()
 
 	if err != nil {
-		panic(err)
+		return false, err
 	}
 
-	// Put the job back into the queue.
-	_, err = client.LPush(
-		ctx,
-		"jobs",
-		jobID,
-	).Result()
-
-	if err != nil {
-		panic(err)
-	}
-
-	// Remove old ownership information.
-	_, err = client.HDel(
-		ctx,
-		"active_jobs",
-		jobID,
-	).Result()
-
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = client.ZRem(
-		ctx,
-		"job_leases",
-		jobID,
-	).Result()
-
-	if err != nil {
-		panic(err)
-	}
+	return res == 1, nil
 }
 
 func main() {
@@ -142,7 +129,15 @@ func main() {
 		jobs := findExpiredJobs(ctx, client)
 
 		for _, jobID := range jobs {
-			recoverJob(ctx, client, jobID)
+			recovered, err := recoverJob(ctx, client, jobID)
+
+			if err != nil {
+				panic(err)
+			}
+
+			if recovered {
+				fmt.Println("Recovered job:", jobID)
+			}
 		}
 
 		time.Sleep(time.Second)

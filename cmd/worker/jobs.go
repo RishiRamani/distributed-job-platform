@@ -2,29 +2,93 @@ package main
 
 import (
 	"context"
+	"distributed-job-platform/internal/job"
 	"encoding/json"
 	"time"
-	"distributed-job-platform/internal/job"
-	"github.com/redis/go-redis/v9"
 
+	"github.com/redis/go-redis/v9"
 )
 
+func completeJob(ctx context.Context,client *redis.Client,newJob job.Job,workerID string)(bool,error){
+	newJob.Status = "completed"
 
-func ownershipOfJob(ctx context.Context,client *redis.Client,jobId string,workerID string)(bool,error){
-
-	res,err:= client.HGet(ctx,"active_jobs",jobId).Result()
-	if(err==redis.Nil){
-		return false,nil
-	}
-	if(err!=nil){
+	jobData, err := json.Marshal(newJob)
+	if err != nil {
 		return false,err
 	}
-	return workerID==res,nil
 
+	script := redis.NewScript(`
+			local owner = redis.call("HGET",KEYS[1],ARGV[1])
+			if owner==ARGV[2] then
+				redis.call("HSET",KEYS[2],ARGV[1],ARGV[3])
+				redis.call("HDEL",KEYS[1],ARGV[1])
+				redis.call("ZREM",KEYS[3],ARGV[1])
+				return 1
+			else
+				return 0
+			end
+	`)
+
+	res, err := script.Run(
+		ctx,
+		client,
+		[]string{
+			"active_jobs",
+			"job_data",
+			"job_leases",
+		},
+		newJob.ID,
+		workerID,
+		string(jobData),
+	).Int64()
+	if err != nil {
+    return false, err
+}
+
+	return res == 1, nil
+}
+
+func failJob(ctx context.Context,client *redis.Client,newJob job.Job,workerID string)(bool,error){
+	newJob.Status = "failed"
+
+	jobData, err := json.Marshal(newJob)
+	if err != nil {
+		return false,err
+	}
+
+	script := redis.NewScript(`
+			local owner = redis.call("HGET",KEYS[1],ARGV[1])
+			if owner==ARGV[2] then
+				redis.call("HSET",KEYS[2],ARGV[1],ARGV[3])
+				redis.call("HDEL",KEYS[1],ARGV[1])
+				redis.call("ZREM",KEYS[3],ARGV[1])
+				return 1
+			else
+				return 0
+			end
+	`)
+
+	res, err := script.Run(
+		ctx,
+		client,
+		[]string{
+			"active_jobs",
+			"job_data",
+			"job_leases",
+		},
+		newJob.ID,
+		workerID,
+		string(jobData),
+	).Int64()
+	if err != nil {
+			return false, err
+	}
+
+	return res == 1, nil
 }
 
 func getJob(ctx context.Context, client *redis.Client) (job.Job, error) {
-	res, err := client.BRPop(ctx, 0, "jobs").Result()
+	res, err := client.BRPop(ctx, time.Second, "jobs").Result()
 	if err != nil {
 		return job.Job{}, err
 	}
@@ -50,22 +114,6 @@ func getJob(ctx context.Context, client *redis.Client) (job.Job, error) {
 	return newJob, nil
 }
 
-func updateJob(ctx context.Context, client *redis.Client, newJob job.Job) error {
-	jsonData, err := json.Marshal(newJob)
-	if err != nil {
-		return err
-	}
-
-	_, err = client.HSet(
-		ctx,
-		"job_data",
-		newJob.ID,
-		string(jsonData),
-	).Result()
-
-	return err
-}
-
 func claimJob(
 	ctx context.Context,
 	client *redis.Client,
@@ -75,54 +123,81 @@ func claimJob(
 
 	newJob.Status = "running"
 
-	err := updateJob(ctx, client, newJob)
-	if err != nil {
-		return err
-	}
-
-	_, err = client.HSet(
-		ctx,
-		"active_jobs",
-		newJob.ID,
-		workerID,
-	).Result()
+	jobData, err := json.Marshal(newJob)
 	if err != nil {
 		return err
 	}
 
 	expiry := time.Now().Add(30 * time.Second).UnixMilli()
 
-	_, err = client.ZAdd(
+	script := redis.NewScript(`
+			redis.call("HSET",KEYS[1],ARGV[1],ARGV[2])
+			redis.call("HSET",KEYS[2],ARGV[1],ARGV[3])
+			redis.call("ZADD",KEYS[3],ARGV[4],ARGV[1])
+			return 1
+	`)
+
+	_, err = script.Run(
 		ctx,
-		"job_leases",
-		redis.Z{
-			Score:  float64(expiry),
-			Member: newJob.ID,
+		client,
+		[]string{
+			"job_data",
+			"active_jobs",
+			"job_leases",
 		},
+		newJob.ID,
+		string(jobData),
+		workerID,
+		expiry,
 	).Result()
 
 	return err
 }
 
-
 func requeue(
 	ctx context.Context,
 	client *redis.Client,
 	newJob job.Job,
-) {
+	workerID string,
+) (bool,error){
+	newJob.Retries++;
 	newJob.Status = "queued"
 
-	err := updateJob(ctx, client, newJob)
+	jobData, err := json.Marshal(newJob)
 	if err != nil {
-		panic(err)
+		return false,err
 	}
 
-	_, err = client.LPush(
+	script := redis.NewScript(`
+			local owner = redis.call("HGET",KEYS[1],ARGV[1])
+			if owner==ARGV[2] then
+				redis.call("HSET",KEYS[2],ARGV[1],ARGV[3])
+				redis.call("LPUSH",KEYS[3],ARGV[1])
+				redis.call("HDEL",KEYS[1],ARGV[1])
+				redis.call("ZREM",KEYS[4],ARGV[1])
+				return 1
+			else
+				return 0
+			end
+	`)
+
+	res, err := script.Run(
 		ctx,
-		"jobs",
+		client,
+		[]string{
+			"active_jobs",
+			"job_data",
+			"jobs",
+			"job_leases",
+		},
 		newJob.ID,
-	).Result()
+		workerID,
+		string(jobData),
+	).Int64()
+
 	if err != nil {
-		panic(err)
+			return false, err
 	}
+
+	return res == 1, nil
 }
