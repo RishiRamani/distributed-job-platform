@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"distributed-job-platform/internal/api"
 	"github.com/redis/go-redis/v9"
+	"os"
 )
 
 
@@ -14,8 +15,13 @@ func main() {
 
 	fmt.Println("API Server Running on localhost:8080")
 
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if(redisAddr==""){
+		redisAddr = "localhost:6379"
+	}
+
 	client := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
+		Addr:     redisAddr,
 		Password: "",
 		DB:       0,
 		Protocol: 2,

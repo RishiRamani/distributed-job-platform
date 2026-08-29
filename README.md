@@ -1,6 +1,6 @@
 # Distributed Job Platform
 
-A small distributed background-job system built with Go and Redis. The project is intentionally implemented from first principles to explore queues, worker ownership, leases, recovery, retries, and shutdown behavior.
+A small distributed background-job system built with Go and Redis. The project explores job queues, worker ownership, lease-based coordination, recovery, retries, and API-level atomicity/idempotency.
 
 ## Current Status
 
@@ -9,18 +9,19 @@ Implemented:
 - HTTP API for creating and looking up jobs
 - Redis-backed queue of job IDs
 - Multiple independent workers consuming the same queue
-- Worker ownership recorded in Redis
+- Worker ownership tracked in Redis
 - 30-second leases with 15-second renewal
 - Ownership-aware lease renewal and completion/failure cleanup
 - Atomic worker state transitions using Redis Lua scripts
+- Atomic, idempotent job creation in the API using a Redis Lua script
 - Reaper-based recovery for expired leases
 - Up to three retries after the initial attempt
-- Graceful worker shutdown that stops taking new jobs and finishes the active job
+- Graceful worker shutdown and Redis-based coordination
+- Docker Compose setup for Redis, API, worker, and reaper
 
 Still limited or planned:
 
 - The only job type is `sleep`.
-- Job creation persists the job and queues its ID in two separate Redis commands.
 - There is no cancellation, priority, scheduling, retry backoff, metrics, or structured logging.
 - Execution is at-least-once rather than exactly-once.
 
@@ -41,6 +42,7 @@ Still limited or planned:
                     |   jobs    |
                     | active... |
                     | leases    |
+                    | idempot...|
                     +-----+-----+
                           |
                     BRPOP jobs
@@ -57,7 +59,7 @@ Still limited or planned:
                     +-----------+
 ```
 
-The API stores a complete job JSON document in `job_data` and pushes only the job ID to `jobs`. A worker pops the ID, loads the canonical record, claims it, and creates a lease. The Reaper looks for expired lease scores and puts abandoned jobs back into the queue.
+The API stores a complete job JSON document in `job_data`, pushes only the job ID to `jobs`, and records idempotency keys in `idempotency_keys` so repeated requests with the same `Idempotency-Key` return the same job instead of creating duplicate work.
 
 ## Job Lifecycle
 
@@ -86,14 +88,31 @@ The retry counter starts at zero. A failed initial attempt can be followed by th
 
 | Key | Redis type | Purpose |
 | --- | --- | --- |
-| `job_data` | Hash | Canonical job JSON, keyed by job ID |
-| `jobs` | List | IDs waiting to be processed |
-| `active_jobs` | Hash | Current owner worker ID, keyed by job ID |
-| `job_leases` | Sorted set | Lease expiration time in Unix milliseconds |
+| `job_data` | Hash | Canonical job JSON keyed by job ID |
+| `jobs` | List | Job IDs waiting to be processed |
+| `active_jobs` | Hash | Current owner worker ID keyed by job ID |
+| `job_leases` | Sorted set | Lease expiration timestamps in Unix milliseconds |
+| `idempotency_keys` | Hash | Idempotency key -> job ID mapping |
 
-There are currently no separate `completed_jobs` or `failed_jobs` structures. Completed and failed states remain in `job_data`, which is also used by the lookup endpoint.
+Completed and failed states remain in `job_data`, which is also used by the lookup endpoint.
 
 ## Ownership and Atomicity
+
+The project uses Redis Lua scripts to keep state transitions consistent and race-safe.
+
+### Job creation atomicity and idempotency
+
+When the API creates a job, it runs a single Redis script that:
+
+1. Checks whether the provided `Idempotency-Key` already maps to a job.
+2. Returns the existing job ID if it does.
+3. Stores the full job payload in `job_data`.
+4. Pushes the job ID onto `jobs`.
+5. Stores the `idempotency_key -> job_id` mapping when an idempotency key is provided.
+
+This makes creation atomic and prevents duplicate work from repeated API requests with the same idempotency key.
+
+### Worker ownership and lease safety
 
 Claiming a job atomically:
 
@@ -109,7 +128,7 @@ The Reaper rechecks the lease expiration inside its recovery script before reque
 
 ## API
 
-The API listens on `localhost:8080`.
+The API listens on `localhost:8080` by default, and also accepts `REDIS_ADDR` for containerized use.
 
 ### Health check
 
@@ -128,6 +147,12 @@ OK
 ```text
 POST /jobs
 Content-Type: application/json
+```
+
+Optional request header:
+
+```text
+Idempotency-Key: <unique client-generated key>
 ```
 
 Request:
@@ -151,6 +176,8 @@ The response contains the generated ID, type, status, duration, and retry count:
 }
 ```
 
+If the same `Idempotency-Key` is sent again, the API returns the same job instead of creating a second record.
+
 ### Look up a job
 
 ```text
@@ -161,7 +188,30 @@ The endpoint reads from `job_data`, so it works while a job is queued, running, 
 
 ## Running Locally
 
-Start Redis on `localhost:6379`, then run each process from the project root in a separate terminal:
+### Option 1: Run with Docker Compose
+
+From the project root:
+
+```powershell
+docker compose up --build
+```
+
+This starts:
+
+- Redis on `localhost:6379`
+- API on `localhost:8080`
+- Worker
+- Reaper
+
+To stop everything:
+
+```powershell
+docker compose down
+```
+
+### Option 2: Run directly with Go
+
+Start Redis locally, then run each process in a separate terminal from the project root:
 
 ```powershell
 go run ./cmd/api
@@ -169,12 +219,15 @@ go run ./cmd/worker
 go run ./cmd/reaper
 ```
 
+The API and workers read from the `REDIS_ADDR` environment variable if set; otherwise they default to `localhost:6379`.
+
 Create a job:
 
 ```powershell
 Invoke-RestMethod -Method Post `
   -Uri http://localhost:8080/jobs `
   -ContentType "application/json" `
+  -Headers @{ "Idempotency-Key" = "client-req-123" } `
   -Body '{"type":"sleep","duration":5}'
 ```
 
@@ -192,7 +245,7 @@ Start multiple worker processes to distribute queued jobs between them. To exerc
 distributed-job-platform/
 |
 |-- cmd/
-|   |-- api/main.go       HTTP API and Redis persistence
+|   |-- api/main.go       API entrypoint and Redis client setup
 |   |-- worker/
 |   |   |-- main.go       worker loop and execution
 |   |   |-- jobs.go       claim, completion, retry, and queue operations
@@ -200,19 +253,34 @@ distributed-job-platform/
 |   |   `-- shutdown.go   signal handling
 |   `-- reaper/main.go    expired-lease recovery
 |
-|-- internal/job/job.go   shared job data structures
+|-- internal/
+|   |-- api/
+|   |   `-- handlers.go   HTTP handlers and idempotent create endpoint
+|   |-- job/
+|   |   `-- job.go        shared job models
+|   |-- reaper/
+|   |   `-- recovery.go   lease expiry handling
+|   |-- worker/
+|   |   `-- *.go          worker logic
+|   `-- testutil/
+|       `-- redis.go      Redis test setup helper
+|
+|-- Dockerfile
+|-- docker-compose.yml
 |-- go.mod
-`-- README.md
+|-- go.sum
+|-- README.md
 ```
 
 ## Design Notes
 
 The system aims for at-least-once execution. A worker can perform work successfully and fail before recording completion, after which the Reaper may make the job available again. External work should therefore be idempotent if duplicate execution would be harmful.
 
-Redis Lua scripts now protect the worker and recovery transitions from stale-worker cleanup races. The next reliability improvements are to make job creation atomic, improve Redis error handling, add tests and observability, and support idempotency or cancellation semantics.
+Redis Lua scripts protect the worker and recovery transitions from stale-worker cleanup races, and the API creation path now prevents duplicate job creation with idempotency keys.
 
 ## Technologies
 
 - Go 1.27
-- Redis
+- Redis 7
+- Docker and Docker Compose
 - `github.com/redis/go-redis/v9`

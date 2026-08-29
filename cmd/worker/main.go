@@ -37,8 +37,14 @@ func main() {
 		time.Now().UnixNano(),
 	)
 
+	redisAddr:= os.Getenv("REDIS_ADDR")
+
+	if(redisAddr==""){
+		redisAddr="localhost:6379"
+	}
+
 	client := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
+		Addr:     redisAddr,
 		Password: "",
 		DB:       0,
 		Protocol: 2,
