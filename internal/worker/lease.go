@@ -1,4 +1,4 @@
-package main
+package worker
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-func renewLease(
+func RenewLease(
 	ctx context.Context,
 	client *redis.Client,
 	jobID string,

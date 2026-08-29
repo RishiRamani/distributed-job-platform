@@ -1,4 +1,4 @@
-package main
+package worker
 
 import(
 	"context"
@@ -6,7 +6,7 @@ import(
 	"os"
 )
 
-func exitWorker(shutdown chan os.Signal, cancel context.CancelFunc){
+func ExitWorker(shutdown chan os.Signal, cancel context.CancelFunc){
 	<-shutdown
 	fmt.Println("Shutdown requested")
 	cancel()

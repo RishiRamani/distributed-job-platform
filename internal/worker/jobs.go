@@ -1,4 +1,4 @@
-package main
+package worker
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-func completeJob(ctx context.Context,client *redis.Client,newJob job.Job,workerID string)(bool,error){
+func CompleteJob(ctx context.Context,client *redis.Client,newJob job.Job,workerID string)(bool,error){
 	newJob.Status = "completed"
 
 	jobData, err := json.Marshal(newJob)
@@ -48,7 +48,7 @@ func completeJob(ctx context.Context,client *redis.Client,newJob job.Job,workerI
 	return res == 1, nil
 }
 
-func failJob(ctx context.Context,client *redis.Client,newJob job.Job,workerID string)(bool,error){
+func FailJob(ctx context.Context,client *redis.Client,newJob job.Job,workerID string)(bool,error){
 	newJob.Status = "failed"
 
 	jobData, err := json.Marshal(newJob)
@@ -87,7 +87,7 @@ func failJob(ctx context.Context,client *redis.Client,newJob job.Job,workerID st
 	return res == 1, nil
 }
 
-func getJob(ctx context.Context, client *redis.Client) (job.Job, error) {
+func GetJob(ctx context.Context, client *redis.Client) (job.Job, error) {
 	res, err := client.BRPop(ctx, time.Second, "jobs").Result()
 	if err != nil {
 		return job.Job{}, err
@@ -114,7 +114,7 @@ func getJob(ctx context.Context, client *redis.Client) (job.Job, error) {
 	return newJob, nil
 }
 
-func claimJob(
+func ClaimJob(
 	ctx context.Context,
 	client *redis.Client,
 	newJob job.Job,
@@ -154,7 +154,7 @@ func claimJob(
 	return err
 }
 
-func requeue(
+func Requeue(
 	ctx context.Context,
 	client *redis.Client,
 	newJob job.Job,

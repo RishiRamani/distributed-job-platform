@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 	"distributed-job-platform/internal/job"
+	"distributed-job-platform/internal/worker"
 	"github.com/redis/go-redis/v9"
 	"os"
 	"os/signal"
@@ -48,10 +49,10 @@ func main() {
 
 	ctx := context.Background()
 
-	go exitWorker(shutdown,cancel)
+	go worker.ExitWorker(shutdown,cancel)
 	
 	for {
-		newJob, err := getJob(shutdownCtx, client)
+		newJob, err := worker.GetJob(shutdownCtx, client)
 		if err != nil {
 			if shutdownCtx.Err() != nil {
 				fmt.Println("Worker shutting down")
@@ -65,14 +66,14 @@ func main() {
 			panic(err)
 		}
 
-		err = claimJob(ctx, client, newJob, workerID)
+		err = worker.ClaimJob(ctx, client, newJob, workerID)
 		if err != nil {
 			panic(err)
 		}
 
 		done := make(chan struct{})
 
-		go renewLease(
+		go worker.RenewLease(
 			ctx,
 			client,
 			newJob.ID,
@@ -84,7 +85,7 @@ func main() {
 
 		if err != nil {
 			if newJob.Retries >= maxRetries {
-				success,err := failJob(ctx,client,newJob,workerID)
+				success,err := worker.FailJob(ctx,client,newJob,workerID)
 				if err != nil {
 					panic(err)
 				}
@@ -92,7 +93,7 @@ func main() {
 					fmt.Println("Lost ownership of job:", newJob.ID)
 				}
 			} else {
-				success,err:=requeue(ctx, client, newJob,workerID)
+				success,err:=worker.Requeue(ctx, client, newJob,workerID)
 				if(err!=nil){
 					panic(err)
 				}
@@ -101,7 +102,7 @@ func main() {
 				}
 			}
 		} else {
-			success,err := completeJob(ctx,client,newJob,workerID)
+			success,err := worker.CompleteJob(ctx,client,newJob,workerID)
 			if err != nil {
 				panic(err)
 			}
