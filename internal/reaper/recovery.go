@@ -6,15 +6,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
-
+	"os"
 	"github.com/redis/go-redis/v9"
 )
 
+func HandleShutdown(shutdown chan os.Signal,cancel context.CancelFunc){
+	<-shutdown
+	fmt.Println("Shutting down the reaper")
+	cancel()
+}
 
 func FindExpiredJobs(
 	ctx context.Context,
 	client *redis.Client,
-) []string {
+) ([]string,error) {
 	jobs, err := client.ZRangeByScore(
 		ctx,
 		"job_leases",
@@ -23,12 +28,12 @@ func FindExpiredJobs(
 			Max: fmt.Sprintf("%d", time.Now().UnixMilli()),
 		},
 	).Result()
-
-	if err != nil {
-		panic(err)
+	
+	if(err!=nil){
+		return nil,err
 	}
 
-	return jobs
+	return jobs,nil
 }
 
 func RecoverJob(

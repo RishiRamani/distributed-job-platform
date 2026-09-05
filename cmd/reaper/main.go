@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"os/signal"
 
-	"fmt"
-	"time"
 	"distributed-job-platform/internal/reaper"
-	"github.com/redis/go-redis/v9"
+	"fmt"
 	"os"
+	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 
@@ -24,10 +26,20 @@ func main() {
 		Protocol: 2,
 	})
 
+	shutdown:= make(chan os.Signal,1)
+	signal.Notify(shutdown,os.Interrupt)
+	shutdownCtx,cancel:=context.WithCancel(context.Background()) 
+	defer cancel()
 	ctx := context.Background()
 
+	go reaper.HandleShutdown(shutdown,cancel)
+
 	for {
-		jobs := reaper.FindExpiredJobs(ctx, client)
+		jobs,err := reaper.FindExpiredJobs(shutdownCtx, client)
+
+		if(err!=nil){
+			return
+		}
 
 		for _, jobID := range jobs {
 			recovered, err := reaper.RecoverJob(ctx, client, jobID)

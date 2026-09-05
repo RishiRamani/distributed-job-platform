@@ -1,14 +1,15 @@
 package main
 
 import (
+	"context"
+	"distributed-job-platform/internal/api"
 	"fmt"
 	"net/http"
-	"distributed-job-platform/internal/api"
-	"github.com/redis/go-redis/v9"
 	"os"
+	"os/signal"
+
+	"github.com/redis/go-redis/v9"
 )
-
-
 
 func main() {
 	http.HandleFunc("/health", api.HealthHandler)
@@ -27,10 +28,21 @@ func main() {
 		Protocol: 2,
 	})
 
-	http.HandleFunc("/jobs", api.CreateJobHandler(client))
-	http.HandleFunc("/jobs/", api.GetJobHandler(client))
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown,os.Interrupt)
 
-	err := http.ListenAndServe(":8080", nil)
+	ctx := context.Background()
+
+	http.HandleFunc("/jobs", api.CreateJobHandler(ctx,client))
+	http.HandleFunc("/jobs/", api.GetJobHandler(ctx,client))
+
+	server := &http.Server{
+    Addr: ":8080",
+	}
+
+	go api.HandleShutdown(shutdown,server)
+
+	err := server.ListenAndServe()
 	if err != nil {
 		fmt.Println(err)
 	}

@@ -23,7 +23,10 @@ func TestFindExpiredJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := FindExpiredJobs(ctx, client)
+	got,err := FindExpiredJobs(ctx, client)
+	if(err!=nil){
+		t.Fatal(err)
+	}
 	if len(got) != 1 || got[0] != "expired-job" {
 		t.Fatalf("FindExpiredJobs() = %v, want [expired-job]", got)
 	}

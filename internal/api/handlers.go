@@ -2,21 +2,37 @@ package api
 
 import (
 	"context"
+	"distributed-job-platform/internal/job"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
-	"distributed-job-platform/internal/job"
+
 	"github.com/redis/go-redis/v9"
 )
 
+
+func HandleShutdown(shutdown chan os.Signal, server *http.Server){
+	<-shutdown
+
+	fmt.Println("Shutdown requested")
+
+	ctx,cancel:=context.WithTimeout(context.Background(),5*time.Second)
+	defer cancel()
+
+	if err:=server.Shutdown(ctx); err!=nil{
+		log.Println("Shutdown error:", err)
+	}
+}
 
 func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "OK")
 }
 
-func CreateJobHandler(client *redis.Client) http.HandlerFunc {
+func CreateJobHandler(ctx context.Context,client *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		if r.Method != http.MethodPost {
@@ -110,7 +126,7 @@ func CreateJobHandler(client *redis.Client) http.HandlerFunc {
 	}
 }
 
-func GetJobHandler(client *redis.Client) http.HandlerFunc {
+func GetJobHandler(ctx context.Context,client *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -119,7 +135,6 @@ func GetJobHandler(client *redis.Client) http.HandlerFunc {
 
 		jobID := strings.TrimPrefix(r.URL.Path, "/jobs/")
 
-		ctx := context.Background()
 
 		jobData, err := client.HGet(
 			ctx,
